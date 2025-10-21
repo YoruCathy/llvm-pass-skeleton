@@ -13,33 +13,84 @@ namespace {
 
 struct SkeletonPass : public PassInfoMixin<SkeletonPass> {
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
-    errs() << "[debug] SkeletonPass running on module: "
-       << M.getName() << "\n";
     bool modified = false;
 
     auto &Ctx = M.getContext();
-    // Declare: void log_fdiv(void);
-    auto logFdiv = M.getOrInsertFunction("log_fdiv", Type::getVoidTy(Ctx));
+
+    // Declare runtime hooks
+    FunctionCallee logFdiv = M.getOrInsertFunction(
+        "log_fdiv", Type::getVoidTy(Ctx));
+    FunctionCallee logDivZero = M.getOrInsertFunction(
+        "log_divzero_check",
+        Type::getVoidTy(Ctx), Type::getDoubleTy(Ctx));
+
+    errs() << "[debug] SkeletonPass running on module: "
+           << M.getName() << "\n";
 
     for (auto &F : M) {
-      if (F.isDeclaration()) continue;
-      for (auto &B : F) {
-        for (auto I = B.begin(), E = B.end(); I != E; /* increment below */) {
-          auto &Inst = *I++;
-          if (auto *BO = dyn_cast<BinaryOperator>(&Inst)) {
-            if (BO->getOpcode() == Instruction::FDiv) {
-              IRBuilder<> builder(&Inst);
-              builder.SetInsertPoint(&B, I); // insert after fdiv
-              builder.CreateCall(logFdiv, {});
-              modified = true;
+        if (F.isDeclaration()) continue;
+
+        for (auto &B : F) {
+            for (auto I = B.begin(), E = B.end(); I != E; ) {
+                Instruction &Inst = *I++;
+                if (auto *BO = dyn_cast<BinaryOperator>(&Inst)) {
+                    unsigned op = BO->getOpcode();
+
+                    // Handle floating-point division
+                    if (op == Instruction::FDiv) {
+                        // Always call log_fdiv
+                        IRBuilder<> builder(&Inst);
+                        builder.SetInsertPoint(BO->getNextNode());
+                        builder.CreateCall(logFdiv, {});
+                        modified = true;
+
+                        // Check for constant zero divisor
+                        Value *rhs = BO->getOperand(1);
+                        if (auto *constVal = dyn_cast<ConstantFP>(rhs)) {
+                            if (constVal->isZeroValue()) {
+                                errs() << "Potential floating-point divide by zero in function "
+                                       << F.getName() << "\n";
+                            }
+                        } else {
+                            // Insert runtime check for variable divisor
+                            IRBuilder<> b2(BO);
+                            b2.SetInsertPoint(BO->getNextNode());
+                            Value *rhsCast = rhs;
+                            if (rhs->getType()->isFloatTy())
+                                rhsCast = b2.CreateFPExt(rhs, Type::getDoubleTy(Ctx));
+                            else if (rhs->getType()->isDoubleTy())
+                                rhsCast = rhs;
+                            else if (rhs->getType()->isIntegerTy())
+                                rhsCast = b2.CreateSIToFP(rhs, Type::getDoubleTy(Ctx));
+
+                            b2.CreateCall(logDivZero, rhsCast);
+                        }
+                    }
+
+                    // Handle integer divisions
+                    else if (op == Instruction::SDiv || op == Instruction::UDiv) {
+                        Value *rhs = BO->getOperand(1);
+                        if (auto *constInt = dyn_cast<ConstantInt>(rhs)) {
+                            if (constInt->isZero()) {
+                                errs() << "Potential integer divide by zero in function "
+                                       << F.getName() << "\n";
+                            }
+                        } else {
+                            IRBuilder<> b3(BO);
+                            b3.SetInsertPoint(BO->getNextNode());
+                            Value *rhsCast = b3.CreateSIToFP(rhs, Type::getDoubleTy(Ctx));
+                            b3.CreateCall(logDivZero, rhsCast);
+                        }
+                        modified = true;
+                    }
+                }
             }
-          }
         }
-      }
     }
 
     return modified ? PreservedAnalyses::none() : PreservedAnalyses::all();
-  }
+}
+
 };
 
 } // namespace

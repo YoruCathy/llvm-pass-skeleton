@@ -1,10 +1,11 @@
 #include <stdio.h>
-#ifdef __cplusplus
-extern "C" {
-#endif
+
 void log_fdiv(void) {
-  fprintf(stderr, "Floating point division detected\n");
+    fprintf(stderr, "Floating-point division detected\n");
 }
-#ifdef __cplusplus
+
+void log_divzero_check(double rhs) {
+    if (rhs == 0.0) {
+        fprintf(stderr, "Runtime divide-by-zero detected\n");
+    }
 }
-#endif

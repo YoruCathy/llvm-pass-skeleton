@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# === Tools ===
 CLANG="$(brew --prefix llvm)/bin/clang"
 OPT="$(brew --prefix llvm)/bin/opt"
-PASS="./build/skeleton/licm/LICMPass.dylib"
 
 ROOT="$(pwd)"
 THIRD="$ROOT/build/third_party"
@@ -11,13 +11,13 @@ EMBENCH_DIR="$THIRD/embench-iot"
 OUTDIR="$ROOT/build/embench_licm"
 mkdir -p "$THIRD" "$OUTDIR"
 
-# Numeric-heavy subset that builds cleanly on macOS
+# === Benchmarks (numeric subset that builds cleanly on macOS) ===
 BENCHES="aha-mont64 crc32 cubic edn matmult-int minver nbody sha"
 
-# Repeat runs (user set to 20 is fine)
-REPS=20
+# === Timing config ===
+REPS=20  # your requested reps
 
-# Host config
+# === Host build flags ===
 HOST_DEFS="-DEMBENCH_NATIVE -DCPU_MHZ=6000 -DHAVE_PRINTF=1"
 HOST_INCS="-I$EMBENCH_DIR/include -I$EMBENCH_DIR/support"
 HOST_WARN="-Wall -Wno-unused-function -Wno-implicit-function-declaration -Wno-macro-redefined"
@@ -38,7 +38,7 @@ discover_sources() {
   find "$EMBENCH_DIR" -type d -name "$b" -exec find {} -type f -name '*.c' \; | sort
 }
 
-# Build a merged TU: include all bench C files + weak stubs + tiny host main
+# === Build a merged TU: include all C files + weak stubs + tiny host main ===
 make_merged_tu() {
   bench="$1"; merged="$2"
   SRCS="$(discover_sources "$bench")"
@@ -71,6 +71,7 @@ __attribute__((weak)) void *memset_beebs(void *dst, int v, unsigned n) {
 #ifndef LOCAL_SCALE_FACTOR
 #define LOCAL_SCALE_FACTOR 100
 #endif
+/* Benchmarks define: int benchmark_body(int rpt); just declare and call it. */
 extern int benchmark_body(int rpt);
 int main(void) {
   volatile int r = benchmark_body(LOCAL_SCALE_FACTOR * CPU_MHZ);
@@ -98,18 +99,16 @@ measure_time_once() {
   (/usr/bin/time -lp "$1" >/dev/null) 2>&1 | awk '/real/ {print $2; exit}'
 }
 
-# Compute median, mean, variance from a tmp list of times
+# Stats from a tmp list of times
 compute_stats_from_file() {
   f="$1"
   cnt="$(wc -l < "$f" | tr -d ' ')"
-  if [ "$cnt" -eq 0 ]; then
+  if [ "$cnt" -eq 0 ] || [ "$cnt" = "0" ]; then
     echo "nan,nan,nan"   # median,mean,var
     return
   fi
-  # median
   mid=$(( (cnt + 1) / 2 ))
   med="$(sort -n "$f" | sed -n "${mid}p")"
-  # mean & variance (population variance) via awk: VAR = E[x^2] - (E[x])^2
   mv="$(awk '{
       n+=1; s+=$1; s2+=$1*$1
     } END {
@@ -133,35 +132,52 @@ measure_time_stats() {
   echo "$stats"   # median,mean,var
 }
 
-ts="$(date +%Y%m%d_%H%M%S)"
-csv="$OUTDIR/results_${ts}.csv"
-printf "benchmark,baseline_median_s,baseline_mean_s,baseline_var_s2,licm_median_s,licm_mean_s,licm_var_s2,speedup_median,speedup_mean\n" > "$csv"
+# === Try a few new-PM pipelines for builtin LICM ===
+run_opt_builtin_licm() {
+  inbc="$1"; outbc="$2"
+  # simplest robust new-PM pipeline
+  if "$OPT" -passes="mem2reg,loop-simplify,loop-rotate,lcssa,licm" "$inbc" -o "$outbc" 2>_opt_err.txt; then
+    rm -f _opt_err.txt
+    return 0
+  fi
+  echo "   !! builtin LICM failed, stderr:"
+  sed 's/^/      /' _opt_err.txt || true
+  rm -f _opt_err.txt
+  return 1
+}
 
-printf "\n%-14s %-11s %-11s %-11s %-11s\n" "Benchmark" "Base_med" "LICM_med" "Spdup_med" "Spdup_mean"
+
+ts="$(date +%Y%m%d_%H%M%S)"
+csv="$OUTDIR/results_builtin_${ts}.csv"
+printf "benchmark,baseline_median_s,baseline_mean_s,baseline_var_s2,builtin_licm_median_s,builtin_licm_mean_s,builtin_licm_var_s2,speedup_median,speedup_mean\n" > "$csv"
+
+printf "\n%-14s %-11s %-12s %-11s %-12s\n" "Benchmark" "Base_med" "Builtin_med" "Spdup_med" "Spdup_mean"
 
 for b in $BENCHES; do
   echo "==> Building $b …"
-  work="$OUTDIR/$b"
+  work="$OUTDIR/${b}_builtin"
   mkdir -p "$work"
   merged="$work/merged_$b.c"
   if ! make_merged_tu "$b" "$merged"; then
     continue
   fi
 
-  # Baseline
+  # Baseline (no LICM)
   base_bc="$work/${b}_base.bc"
   compile_bc "$merged" "$base_bc"
   "$OPT" -passes="mem2reg,loop-simplify" "$base_bc" -o "$base_bc"
   link_exe_from_bc "$base_bc" "$work/${b}_base.out"
 
-  # LICM
+  # Builtin LICM (new PM variants)
   licm_bc="$work/${b}_licm.bc"
   compile_bc "$merged" "$licm_bc"
-  "$OPT" -load-pass-plugin "$PASS" -passes="mem2reg,loop-simplify,my-licm" "$licm_bc" -o "$licm_bc"
+  if ! run_opt_builtin_licm "$licm_bc" "$licm_bc"; then
+    echo "   !! skipping timing for $b due to LICM failure"
+    continue
+  fi
   link_exe_from_bc "$licm_bc" "$work/${b}_licm.out"
 
-  # Stats: median,mean,var for each
-  # shellcheck disable=SC2034
+  # Stats
   IFS=, read -r base_med base_mean base_var <<<"$(measure_time_stats "$work/${b}_base.out" "$REPS")"
   IFS=, read -r licm_med licm_mean licm_var <<<"$(measure_time_stats "$work/${b}_licm.out" "$REPS")"
 
@@ -169,7 +185,7 @@ for b in $BENCHES; do
   spd_med="$(awk -v b="$base_med" -v l="$licm_med" 'BEGIN{ if (b ~ /^[0-9.]+$/ && l ~ /^[0-9.]+$/ && l+0>0) printf("%.3f",(b+0)/(l+0)); else print "nan"; }')"
   spd_mean="$(awk -v b="$base_mean" -v l="$licm_mean" 'BEGIN{ if (b ~ /^[0-9.]+$/ && l ~ /^[0-9.]+$/ && l+0>0) printf("%.3f",(b+0)/(l+0)); else print "nan"; }')"
 
-  printf "%-14s %-11s %-11s %-11s %-11s\n" "$b" "$base_med" "$licm_med" "$spd_med" "$spd_mean"
+  printf "%-14s %-11s %-12s %-11s %-12s\n" "$b" "$base_med" "$licm_med" "$spd_med" "$spd_mean"
   printf "%s,%s,%s,%s,%s,%s,%s,%s,%s\n" \
     "$b" "$base_med" "$base_mean" "$base_var" "$licm_med" "$licm_mean" "$licm_var" "$spd_med" "$spd_mean" >> "$csv"
 done
